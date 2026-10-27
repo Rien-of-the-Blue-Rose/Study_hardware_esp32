@@ -1,0 +1,142 @@
+{
+    "version": 1,
+    "author": "Sony",
+    "editor": "wokwi",
+    "parts": [
+        {
+            "type": "wokwi-esp32-devkit-v1",
+            "id": "esp",
+            "top": -81.7,
+            "left": -62.6,
+            "rotate": 180,
+            "attrs": {}
+        },
+        {
+            "type": "wokwi-led",
+            "id": "led1",
+            "top": -29.6,
+            "left": -133,
+            "rotate": 270,
+            "attrs": {
+                "color": "blue"
+            }
+        },
+        {
+            "type": "wokwi-led",
+            "id": "led2",
+            "top": -10.4,
+            "left": -133,
+            "rotate": 270,
+            "attrs": {
+                "color": "yellow"
+            }
+        },
+        {
+            "type": "wokwi-led",
+            "id": "led3",
+            "top": 18.4,
+            "left": -133,
+            "rotate": 270,
+            "attrs": {
+                "color": "yellow"
+            }
+        },
+        {
+            "type": "wokwi-led",
+            "id": "led4",
+            "top": 56.8,
+            "left": -133,
+            "rotate": 270,
+            "attrs": {
+                "color": "yellow"
+            }
+        }
+    ],
+    "connections": [
+        [
+            "esp:TX0",
+            "$serialMonitor:RX",
+            "",
+            []
+        ],
+        [
+            "esp:RX0",
+            "$serialMonitor:TX",
+            "",
+            []
+        ],
+        [
+            "led4:A",
+            "esp:RX2",
+            "green",
+            [
+                "h28.8",
+                "v-67.2"
+            ]
+        ],
+        [
+            "led3:A",
+            "esp:D4",
+            "green",
+            [
+                "h19.2",
+                "v-19.2"
+            ]
+        ],
+        [
+            "esp:GND.1",
+            "led1:C",
+            "black",
+            [
+                "h-29.5",
+                "v26.7"
+            ]
+        ],
+        [
+            "esp:GND.1",
+            "led4:C",
+            "black",
+            [
+                "h-29.5",
+                "v113.1"
+            ]
+        ],
+        [
+            "esp:GND.1",
+            "led2:C",
+            "black",
+            [
+                "h-29.5",
+                "v45.9"
+            ]
+        ],
+        [
+            "esp:GND.1",
+            "led3:C",
+            "black",
+            [
+                "h-29.5",
+                "v74.7"
+            ]
+        ],
+        [
+            "led2:A",
+            "esp:D2",
+            "green",
+            [
+                "h19.2",
+                "v-9.6"
+            ]
+        ],
+        [
+            "led1:A",
+            "esp:D15",
+            "green",
+            [
+                "h19.2",
+                "v-9.6"
+            ]
+        ]
+    ],
+    "dependencies": {}
+}
