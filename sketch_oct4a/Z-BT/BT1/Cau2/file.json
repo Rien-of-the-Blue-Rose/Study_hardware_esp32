@@ -1,3 +1,4 @@
+
 {
   "version": 1,
   "author": "Uri Shaked",
@@ -124,12 +125,13 @@
       "rotate": 90,
       "attrs": { "color": "red" }
     },
+
     {
       "type": "wokwi-pushbutton-6mm",
       "id": "btn1",
       "top": 189.8,
       "left": 124.8,
-      "attrs": { "color": "green", "xray": "1", "bounce": "0" }
+      "attrs": { "color": "green", "xray": "1" }
     },
     {
       "type": "wokwi-pushbutton-6mm",
@@ -166,10 +168,12 @@
     [ "r8:1", "esp:19", "green", [ "v0" ] ],
     [ "led8:A", "r8:2", "green", [ "v0" ] ],
     [ "led8:C", "led7:C", "green", [ "v0" ] ],
-    [ "btn1:1.r", "led1:C", "green", [ "v0" ] ],
+
+    [ "btn1:1.l", "esp:0", "green", [ "h0" ] ],
+    [ "btn1:2.r", "led1:C", "green", [ "v0" ] ],
+
     [ "esp:25", "btn2:1.r", "green", [ "v0" ] ],
-    [ "btn2:2.l", "esp:GND.1", "green", [ "h0", "v29.2" ] ],
-    [ "btn1:1.l", "esp:0", "green", [ "h0" ] ]
+    [ "btn2:2.l", "esp:GND.1", "green", [ "h0", "v29.2" ] ]
   ],
   "dependencies": {}
 }
