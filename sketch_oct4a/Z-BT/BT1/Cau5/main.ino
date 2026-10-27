@@ -1,312 +1,164 @@
 // src/main.cpp
 #include <Arduino.h>
 
-// Định nghĩa mảng 8 chân GPIO điều khiển LED theo thứ tự từ LED 1 đến LED 8
-const uint8_t LED_PINS[8] = {19, 18, 5, 17, 16, 4, 2, 15};
-const uint8_t TOTAL_LEDS = 8;
-
 // =============================================================================
-// [ĐOẠN THAY ĐỔI NỔI BẬT 1: THIẾT LẬP PWM THEO CHUẨN ARDUINO ESP32 CORE V3.X+]
-// - Core 3.x+ loại bỏ hoàn toàn cơ chế gán kênh thủ công (ledcSetup, ledcAttachPin).
-// - Chuyển sang API mới: ledcAttach(pin, freq, resolution) và ledcWrite(pin, duty).
+// [CẤU HÌNH PHẦN CỨNG NỘI DUNG 5]
+// - LED mục tiêu: GPIO 2 (LED thứ 7 trên dãy 8 LED của bài 1)
+// - Phím 1 (TĂNG ĐỘ SÁNG): GPIO 0 (Nút Boot tích hợp sẵn trên ESP32)
+// - Phím 2 (GIẢM ĐỘ SÁNG): GPIO 25 (Nút nhấn rời lắp thêm, chế độ INPUT_PULLUP)
 // =============================================================================
 
-const uint32_t PWM_FREQ = 5000;    // Tần số 5kHz chống nhấp nháy mắt người
-const uint8_t  PWM_RES  = 8;       // Độ phân giải 8-bit (Giá trị Duty Cycle từ 0 đến 255)
+const uint8_t LED_TARGET_PIN = 2; // Chân điều khiển LED thay đổi độ sáng
+const uint8_t BTN_UP_PIN     = 0; // Phím Boot: Tăng độ sáng
+const uint8_t BTN_DOWN_PIN   = 25;// Phím lắp thêm: Giảm độ sáng
 
-/* =============================================================================
-   [COMMENT BLOCK - GIẢI THÍCH PHẦN ĐÃ SỬA]:
-   - Trên ESP32 Arduino Core 3+, kênh PWM (0-15) được driver tự động cấp phát ngầm.
-   - Hàm ledcAttach(pin, freq, resolution) gắn trực tiếp cấu hình PWM vào chân GPIO.
-   - Thao tác xuất độ sáng dùng trực tiếp chân: ledcWrite(pin, duty).
-   ============================================================================= */
+// Danh sách các chân LED còn lại để tắt triệt để, tránh sáng ngầm
+const uint8_t OTHER_LEDS[] = {19, 18, 5, 17, 16, 4, 15};
+const uint8_t NUM_OTHER_LEDS = sizeof(OTHER_LEDS) / sizeof(OTHER_LEDS[0]);
 
-// --- CẤU TRÚC ĐIỀU KHIỂN ĐỘ SÁNG NON-BLOCKING (STATE STRUCTS) ---
+// =============================================================================
+// [CẤU HÌNH PWM VÀ THANG ĐỘ SÁNG PHI TUYẾN (ESP32 CORE 3.X+)]
+// =============================================================================
+const uint32_t PWM_FREQ = 1000; // 1000Hz tối ưu mô phỏng Wokwi
+const uint8_t  PWM_RES  = 8;    // Độ phân giải 8-bit (0 - 255)
 
-struct BreathingState {
-    unsigned long lastUpdate = 0;
-    int16_t duty = 0;
-    int8_t step = 3;
-    uint8_t cycleCount = 0;
-    const unsigned long INTERVAL = 12; // 12ms mỗi bước biến thiên
+const uint8_t MAX_LEVEL = 10;   // Thang chia 10 nấc độ sáng (Mức 0 = Tắt, Mức 10 = Cực đại)
+uint8_t brightnessLevel = 0;    // Khởi tạo ban đầu ở mức 0 (Tắt)
+
+// Bảng tra Duty Cycle kết hợp Gamma Correction chuẩn hóa cho 10 nấc độ sáng
+// Giúp mắt người và đồ họa Wokwi thấy từng nấc biến thiên rõ rệt:
+const uint8_t GAMMA_LEVELS[MAX_LEVEL + 1] = {
+    0,   // Mức 0: Tắt hoàn toàn (0%)
+    3,   // Mức 1: Nhú sáng mờ (1.2%)
+    8,   // Mức 2: Sáng nhẹ (3.1%)
+    16,  // Mức 3: (6.3%)
+    28,  // Mức 4: (11.0%)
+    45,  // Mức 5: Sáng trung bình (17.6%)
+    72,  // Mức 6: (28.2%)
+    110, // Mức 7: (43.1%)
+    155, // Mức 8: (60.8%)
+    205, // Mức 9: (80.4%)
+    255  // Mức 10: Sáng cực đại (100%)
 };
 
-struct WaveState {
-    unsigned long lastUpdate = 0;
-    uint16_t wavePhase = 0;
-    uint16_t stepCount = 0;
-    const unsigned long INTERVAL = 20;
+// =============================================================================
+// [CẤU TRÚC MÁY TRẠNG THÁI CHỐNG DỘI PHÍM ĐỘC LẬP (DUAL FSM DEBOUNCE)]
+// =============================================================================
+enum ButtonFsmState {
+    BTN_STATE_IDLE,
+    BTN_STATE_DEBOUNCE_PRESS,
+    BTN_STATE_HELD,
+    BTN_STATE_DEBOUNCE_RELEASE
 };
 
-struct SequentialFadeState {
-    unsigned long lastUpdate = 0;
-    uint8_t currentLed = 0;
-    int16_t duty = 0;
-    int8_t step = 5;
-    const unsigned long INTERVAL = 8;
+struct DebouncedButton {
+    uint8_t pin;
+    ButtonFsmState state;
+    unsigned long timer;
+    const unsigned long DEBOUNCE_MS = 50; // 50ms chống dội
 };
 
-struct DualPhaseState {
-    unsigned long lastUpdate = 0;
-    int16_t duty = 0;
-    int8_t step = 2;
-    uint8_t cycleCount = 0;
-    const unsigned long INTERVAL = 15;
-};
+DebouncedButton btnUp   = {BTN_UP_PIN,   BTN_STATE_IDLE, 0};
+DebouncedButton btnDown = {BTN_DOWN_PIN, BTN_STATE_IDLE, 0};
 
-struct CometState {
-    unsigned long lastUpdate = 0;
-    int8_t head = 0;
-    uint8_t round = 0;
-    const unsigned long INTERVAL = 80;
-};
+// Cập nhật độ sáng ra phần cứng và in trạng thái ra Serial Monitor
+void applyBrightness(const char* actionReason) {
+    uint8_t duty = GAMMA_LEVELS[brightnessLevel];
+    ledcWrite(LED_TARGET_PIN, duty);
 
-// Khởi tạo các biến trạng thái
-BreathingState      stateBreathe;
-WaveState           stateWave;
-SequentialFadeState stateSeqFade;
-DualPhaseState      stateDualPhase;
-CometState          stateComet;
+    Serial.printf("[SU KIEN: %s] -> Nac: %u/%u | Duty PWM: %3u/255 | Cong suat: %3u%%\n",
+                  actionReason,
+                  brightnessLevel,
+                  MAX_LEVEL,
+                  duty,
+                  (brightnessLevel * 100) / MAX_LEVEL);
+}
 
-uint8_t currentBrightnessEffect = 1;
+// Hàm quét nút nhấn chống dội FSM: Trả về true CHỈ 1 LẦN duy nhất khi nhấn phím thành công
+bool checkButtonPress(DebouncedButton &btn) {
+    int pinVal = digitalRead(btn.pin);
+    unsigned long currentMillis = millis();
 
-// Hàm phụ trợ
-void setAllPwm(uint8_t duty);
+    switch (btn.state) {
+        case BTN_STATE_IDLE:
+            if (pinVal == LOW) { // Phát hiện bắt đầu chạm phím
+                btn.timer = currentMillis;
+                btn.state = BTN_STATE_DEBOUNCE_PRESS;
+            }
+            break;
 
-// Khai báo 5 hiệu ứng biến đổi độ sáng độc lập (Non-blocking)
-bool effect1_breathingAll();
-bool effect2_brightnessWave();
-bool effect3_sequentialFade();
-bool effect4_dualPhaseBreathe();
-bool effect5_cometTail();
+        case BTN_STATE_DEBOUNCE_PRESS:
+            if (pinVal == HIGH) {
+                btn.state = BTN_STATE_IDLE; // Nhiễu nảy tiếp điểm < 50ms
+            } else if (currentMillis - btn.timer >= btn.DEBOUNCE_MS) {
+                btn.state = BTN_STATE_HELD;
+                return true; // XÁC NHẬN NHẤN THÀNH CÔNG (CHỈ TRẢ VỀ TRUE ĐÚNG 1 LẦN)
+            }
+            break;
+
+        case BTN_STATE_HELD:
+            if (pinVal == HIGH) { // Bắt đầu nhả phím
+                btn.timer = currentMillis;
+                btn.state = BTN_STATE_DEBOUNCE_RELEASE;
+            }
+            break;
+
+        case BTN_STATE_DEBOUNCE_RELEASE:
+            if (pinVal == LOW) {
+                btn.timer = currentMillis;
+            } else if (currentMillis - btn.timer >= btn.DEBOUNCE_MS) {
+                btn.state = BTN_STATE_IDLE; // Đã nhả tay hoàn toàn, sẵn sàng cho lần bấm sau
+            }
+            break;
+    }
+    return false;
+}
 
 void setup() {
-    // =========================================================================
-    // [ĐOẠN THAY ĐỔI NỔI BẬT 2: KHỞI TẠO NGOẠI VI PWM THAY CHO OUTPUT KỸ THUẬT SỐ]
-    // =========================================================================
-    for (uint8_t i = 0; i < TOTAL_LEDS; i++) {
-        // Cú pháp chuẩn ESP32 Core v3.x+
-        ledcAttach(LED_PINS[i], PWM_FREQ, PWM_RES);
-        ledcWrite(LED_PINS[i], 0);
-    }
-}
-/* =============================================================================
-   [COMMENT BLOCK - GIẢI THÍCH PHẦN ĐÃ SỬA]:
-   - Thay thế pinMode(..., OUTPUT) và digitalWrite(..., LOW) bằng ledcAttach()
-     và ledcWrite(..., 0) để khởi tạo chân ở chế độ điều rộng xung PWM 8-bit.
-   ============================================================================= */
+    Serial.begin(115200);
 
-// =============================================================================
-// [ĐOẠN THAY ĐỔI NỔI BẬT 3: BỘ ĐIỀU PHỐI TUẦN TỰ CÁC HIỆU ỨNG ĐỘ SÁNG]
-// =============================================================================
+    // Cấu hình 2 phím bấm sử dụng điện trở kéo lên nội bộ (Active-LOW)
+    pinMode(BTN_UP_PIN, INPUT_PULLUP);
+    pinMode(BTN_DOWN_PIN, INPUT_PULLUP);
+
+    // Tắt toàn bộ các LED không dùng đến
+    for (uint8_t i = 0; i < NUM_OTHER_LEDS; i++) {
+        pinMode(OTHER_LEDS[i], OUTPUT);
+        digitalWrite(OTHER_LEDS[i], LOW);
+    }
+
+    // Cấu hình LEDC PWM chân GPIO 2 theo chuẩn Core v3.x+
+    ledcAttach(LED_TARGET_PIN, PWM_FREQ, PWM_RES);
+    applyBrightness("KHOI TAO");
+
+    delay(300);
+    Serial.println("==================================================");
+    Serial.println("    ESP32 CORE 3+ NDS: HE THONG DIEU KHIEN DO SANG");
+    Serial.println(" - Phim Boot (GPIO 0) : TANG do sang 1 nac       ");
+    Serial.println(" - Phim ngoai (GPIO 25): GIAM do sang 1 nac       ");
+    Serial.println("==================================================");
+}
+
 void loop() {
-    switch (currentBrightnessEffect) {
-        case 1:
-            if (effect1_breathingAll()) currentBrightnessEffect = 2;
-            break;
-        case 2:
-            if (effect2_brightnessWave()) currentBrightnessEffect = 3;
-            break;
-        case 3:
-            if (effect3_sequentialFade()) currentBrightnessEffect = 4;
-            break;
-        case 4:
-            if (effect4_dualPhaseBreathe()) currentBrightnessEffect = 5;
-            break;
-        case 5:
-            if (effect5_cometTail()) currentBrightnessEffect = 1;
-            break;
-    }
-}
-/* =============================================================================
-   [COMMENT BLOCK - GIẢI THÍCH PHẦN ĐÃ SỬA]:
-   - Chuyển máy trạng thái FSM sang điều phối 5 giải thuật biến thiên độ sáng PWM
-     thay vì các hiệu ứng bật/tắt (ON/OFF) rời rạc của Nội dung 1 & 3.
-   ============================================================================= */
-
-void setAllPwm(uint8_t duty) {
-    for (uint8_t i = 0; i < TOTAL_LEDS; i++) {
-        ledcWrite(LED_PINS[i], duty);
-    }
-}
-
-// =============================================================================
-// [ĐOẠN THAY ĐỔI NỔI BẬT 4: CHI TIẾT 5 THUẬT TOÁN BIẾN THIÊN ĐỘ SÁNG PWM]
-// =============================================================================
-
-// Hiệu ứng 1: Toàn bộ 8 LED "thở" (Breathing Light) đồng loạt (Chạy 2 chu kỳ)
-bool effect1_breathingAll() {
-    unsigned long currentMillis = millis();
-    if (currentMillis - stateBreathe.lastUpdate >= stateBreathe.INTERVAL) {
-        stateBreathe.lastUpdate = currentMillis;
-
-        setAllPwm(stateBreathe.duty);
-        stateBreathe.duty += stateBreathe.step;
-
-        // Đảo chiều biến thiên khi chạm ngưỡng 0 hoặc 255
-        if (stateBreathe.duty >= 255) {
-            stateBreathe.duty = 255;
-            stateBreathe.step = -abs(stateBreathe.step);
-        } else if (stateBreathe.duty <= 0) {
-            stateBreathe.duty = 0;
-            stateBreathe.step = abs(stateBreathe.step);
-            stateBreathe.cycleCount++;
-
-            if (stateBreathe.cycleCount >= 2) {
-                stateBreathe.cycleCount = 0;
-                return true; // Kết thúc hiệu ứng
-            }
+    // 1. Quét phím TĂNG (GPIO 0 - Boot)
+    if (checkButtonPress(btnUp)) {
+        if (brightnessLevel < MAX_LEVEL) {
+            brightnessLevel++;
+            applyBrightness("PHIM BOOT (TANG)");
+        } else {
+            Serial.println("[CANH BAO] Do sang da dat muc TOI DA (10/10)!");
         }
     }
-    return false;
-}
-/* =============================================================================
-   [COMMENT BLOCK - GIẢI THÍCH PHẦN ĐÃ SỬA]:
-   - Độ sáng toàn hàng LED tăng dần mượt mà từ 0 -> 255 (tỏ dần), sau đó giảm từ
-     255 -> 0 (mờ dần). Không xảy ra hiện tượng bật/tắt tức thời.
-   ============================================================================= */
 
-// Hiệu ứng 2: Sóng độ sáng lan truyền (Traveling Brightness Wave)
-bool effect2_brightnessWave() {
-    unsigned long currentMillis = millis();
-    if (currentMillis - stateWave.lastUpdate >= stateWave.INTERVAL) {
-        stateWave.lastUpdate = currentMillis;
-
-        for (uint8_t i = 0; i < TOTAL_LEDS; i++) {
-            // Tính toán lệch pha độ sáng tam giác giữa các LED liền kề (bước pha 32 đơn vị)
-            uint8_t localPhase = (stateWave.wavePhase + i * 32) & 0xFF;
-            uint8_t duty = (localPhase < 128) ? (localPhase * 2) : ((255 - localPhase) * 2);
-            ledcWrite(LED_PINS[i], duty);
-        }
-
-        stateWave.wavePhase += 6;
-        stateWave.stepCount++;
-
-        if (stateWave.stepCount >= 200) { // Chạy quét sóng ~4 giây
-            stateWave.stepCount = 0;
-            stateWave.wavePhase = 0;
-            setAllPwm(0);
-            return true;
+    // 2. Quét phím GIẢM (GPIO 25 - Nút gắn thêm)
+    if (checkButtonPress(btnDown)) {
+        if (brightnessLevel > 0) {
+            brightnessLevel--;
+            applyBrightness("PHIM PHU (GIAM)");
+        } else {
+            Serial.println("[CANH BAO] Do sang da o muc TAT (0/10)!");
         }
     }
-    return false;
+
+    // CPU hoàn toàn rảnh rỗi (Non-blocking), không sử dụng delay()
 }
-/* =============================================================================
-   [COMMENT BLOCK - GIẢI THÍCH PHẦN ĐÃ SỬA]:
-   - Tạo chênh lệch độ sáng liên tục giữa 8 LED bằng giải thuật dịch pha (phase shift),
-     tạo cảm giác dải sáng dập dềnh trôi dọc từ LED 1 sang LED 8.
-   ============================================================================= */
-
-// Hiệu ứng 3: Từng LED lần lượt tỏ dần rồi mờ dần nối tiếp (Sequential Cascade Fade)
-bool effect3_sequentialFade() {
-    unsigned long currentMillis = millis();
-    if (currentMillis - stateSeqFade.lastUpdate >= stateSeqFade.INTERVAL) {
-        stateSeqFade.lastUpdate = currentMillis;
-
-        ledcWrite(LED_PINS[stateSeqFade.currentLed], stateSeqFade.duty);
-        stateSeqFade.duty += stateSeqFade.step;
-
-        if (stateSeqFade.duty >= 255) {
-            stateSeqFade.duty = 255;
-            stateSeqFade.step = -abs(stateSeqFade.step);
-        } else if (stateSeqFade.duty <= 0) {
-            stateSeqFade.duty = 0;
-            stateSeqFade.step = abs(stateSeqFade.step);
-            ledcWrite(LED_PINS[stateSeqFade.currentLed], 0);
-
-            stateSeqFade.currentLed++;
-            if (stateSeqFade.currentLed >= TOTAL_LEDS) {
-                stateSeqFade.currentLed = 0;
-                return true; // Hoàn thành quét qua 8 LED
-            }
-        }
-    }
-    return false;
-}
-/* =============================================================================
-   [COMMENT BLOCK - GIẢI THÍCH PHẦN ĐÃ SỬA]:
-   - Thay vì bật tắt lập tức, mỗi LED khi đến lượt sẽ tăng từ từ độ sáng lên đỉnh,
-     sau đó giảm êm dịu về 0 rồi mới chuyển quyền điều khiển sang bóng kế tiếp.
-   ============================================================================= */
-
-// Hiệu ứng 4: Thở nghịch pha đối xứng giữa 2 cụm LED (Dual-Phase Seesaw Fade)
-bool effect4_dualPhaseBreathe() {
-    unsigned long currentMillis = millis();
-    if (currentMillis - stateDualPhase.lastUpdate >= stateDualPhase.INTERVAL) {
-        stateDualPhase.lastUpdate = currentMillis;
-
-        uint8_t dutyLeft = stateDualPhase.duty;
-        uint8_t dutyRight = 255 - stateDualPhase.duty;
-
-        // Cụm trái (LED 1 - LED 4)
-        for (uint8_t i = 0; i < 4; i++) {
-            ledcWrite(LED_PINS[i], dutyLeft);
-        }
-        // Cụm phải (LED 5 - LED 8)
-        for (uint8_t i = 4; i < TOTAL_LEDS; i++) {
-            ledcWrite(LED_PINS[i], dutyRight);
-        }
-
-        stateDualPhase.duty += stateDualPhase.step;
-
-        if (stateDualPhase.duty >= 255) {
-            stateDualPhase.duty = 255;
-            stateDualPhase.step = -abs(stateDualPhase.step);
-        } else if (stateDualPhase.duty <= 0) {
-            stateDualPhase.duty = 0;
-            stateDualPhase.step = abs(stateDualPhase.step);
-            stateDualPhase.cycleCount++;
-
-            if (stateDualPhase.cycleCount >= 3) {
-                stateDualPhase.cycleCount = 0;
-                setAllPwm(0);
-                return true;
-            }
-        }
-    }
-    return false;
-}
-/* =============================================================================
-   [COMMENT BLOCK - GIẢI THÍCH PHẦN ĐÃ SỬA]:
-   - Phân chia 8 LED thành 2 nửa: Cụm 1..4 nhận duty, cụm 5..8 nhận (255 - duty).
-   - Khi cụm trái đạt độ sáng cực đại thì cụm phải tắt hoàn toàn và ngược lại.
-   ============================================================================= */
-
-// Hiệu ứng 5: Vệt sáng sao băng với đuôi phân tầng mờ dần (Comet / Meteor Decay)
-bool effect5_cometTail() {
-    unsigned long currentMillis = millis();
-    if (currentMillis - stateComet.lastUpdate >= stateComet.INTERVAL) {
-        stateComet.lastUpdate = currentMillis;
-
-        // Xóa sạch trạng thái trước đó
-        setAllPwm(0);
-
-        int8_t h = stateComet.head;
-
-        // Thiết lập gradient độ sáng theo khoảng cách sau đầu sao băng (Head)
-        if (h >= 0 && h < TOTAL_LEDS)          ledcWrite(LED_PINS[h], 255);    // Điểm đầu: 100% độ sáng
-        if ((h - 1) >= 0 && (h - 1) < TOTAL_LEDS) ledcWrite(LED_PINS[h - 1], 90); // Thân vệt: ~35% độ sáng
-        if ((h - 2) >= 0 && (h - 2) < TOTAL_LEDS) ledcWrite(LED_PINS[h - 2], 25); // Đuôi vệt: ~10% độ sáng
-        if ((h - 3) >= 0 && (h - 3) < TOTAL_LEDS) ledcWrite(LED_PINS[h - 3], 5);  // Tàn dư: ~2% độ sáng
-
-        stateComet.head++;
-
-        // Cho vệt sáng quét trôi ra khỏi biên LED 8
-        if (stateComet.head >= TOTAL_LEDS + 3) {
-            stateComet.head = 0;
-            stateComet.round++;
-
-            if (stateComet.round >= 3) {
-                stateComet.round = 0;
-                setAllPwm(0);
-                return true;
-            }
-        }
-    }
-    return false;
-}
-/* =============================================================================
-   [COMMENT BLOCK - GIẢI THÍCH PHẦN ĐÃ SỬA]:
-   - Sử dụng các mức duty PWM không đồng nhất (255 -> 90 -> 25 -> 5) phân bổ trên
-     các LED liền kề để tạo hiệu ứng thị giác vệt đuôi sao băng lướt qua hàng LED.
-   ============================================================================= */
