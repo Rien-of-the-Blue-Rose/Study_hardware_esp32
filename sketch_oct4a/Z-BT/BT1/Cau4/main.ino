@@ -5,165 +5,148 @@ const uint8_t LED_PINS[8] = {19, 18, 5, 17, 16, 4, 2, 15};
 const uint8_t TOTAL_LEDS = 8;
 
 const uint32_t PWM_FREQ = 5000;
-const uint8_t  PWM_RES  = 8; // Độ phân giải 8-bit (0 - 255)
+const uint8_t  PWM_RES  = 8; // 8-bit (0 - 255)
 
 // =============================================================================
-// [ĐOẠN THAY ĐỔI NỔI BẬT 1: CẤU TRÚC ĐIỀU KHIỂN DẢI GRADIENT ĐỐI XỨNG LỆCH PHA]
-// - Thiết lập 2 chế độ biến đổi gradient động:
-//   1. Seesaw Gradient (Bập bênh tuyến tính): LED 1 max (255) -> LED 8 min (0), 
-//      sau đó nghiêng dốc ngược lại LED 1 min -> LED 8 max.
-//   2. Rotating Gradient Wave (Sóng dốc quay vòng): Cực đại và cực tiểu luôn 
-//      cách nhau 180 độ (4 bước chân LED), dịch chuyển liên tục qua hàng LED.
+// [ĐOẠN THAY ĐỔI NỔI BẬT 1: KHÔI PHỤC NGƯỠNG SÀN 10% VÀ TÍNH TOÁN INTERVAL >= 10S]
+// - Sửa DUTY_0 (0) quay lại DUTY_10 = 26 (round(255 * 0.10) = 25.5 -> 26).
+// - Giữ FADE_STEP = 8 mỗi nấc.
+// - Khoảng dốc: 255 - 26 = 229 đơn vị -> Cần 29 bước nhảy cho mỗi LED.
+// - Cấu hình INTERVAL = 45ms: 29 bước * 8 LED * 45ms = 10440ms = 10.44 giây.
 // =============================================================================
+const uint8_t DUTY_100 = 255;
+const uint8_t DUTY_10  = 7; // Mức sàn 10%: giữ sáng mờ, không ngắt dòng
 
-struct GradientSeesawState {
-    unsigned long lastUpdate = 0;
-    int16_t headDuty = 255;  // Độ sáng của LED 1 (0 -> 255)
-    int8_t step = -2;        // Tốc độ biến thiên dốc
-    uint8_t cycleCount = 0;
-    const unsigned long INTERVAL = 12; // 12ms mỗi bước nội suy
-};
+const uint8_t       FADE_STEP = 8;  // Bước nhảy 8 đơn vị duty
+const unsigned long INTERVAL  = 45; // 45ms mỗi bước -> 8 LED quét mất 10.44 giây
+const unsigned long PAUSE_MS  = 300;
 
-struct GradientWaveState {
-    unsigned long lastUpdate = 0;
-    uint16_t waveAngle = 0;  // Góc pha quét (0 -> 359 độ)
-    uint16_t stepCount = 0;
-    const unsigned long INTERVAL = 15;
-};
-
-GradientSeesawState stateSeesaw;
-GradientWaveState   stateWave;
-
-uint8_t currentMode = 1;
-
+const unsigned long SERIAL_INTERVAL = 500; // Serial in telemetry mỗi 0.5 giây
 /* =============================================================================
    [COMMENT BLOCK - GIẢI THÍCH PHẦN ĐÃ SỬA]:
-   - Thay thế toàn bộ 5 hiệu ứng PWM cũ bằng 2 cấu trúc Gradient động tập trung 
-     vào nguyên lý chênh lệch độ sáng đối đỉnh giữa LED 1 và LED 8.
-   - Chu kỳ cập nhật 12-15ms đảm bảo tần số quét trên 60 FPS, mắt người không 
-     thể nhận thấy độ giật khi dải sáng trôi.
+   - Khôi phục hằng số `DUTY_10 = 26` thay thế cho mức `DUTY_0 = 0` bị nhầm lẫn ở bản trước.
+   - Tính toán lại `INTERVAL = 45ms` để khớp với 29 bước nhảy của khoảng dải 229,
+     đảm bảo tổng thời gian quét qua 8 LED vượt ngưỡng tối thiểu 10 giây (10.44s).
    ============================================================================= */
 
-// Khai báo hàm
-bool runGradientSeesaw();
-bool runRotatingGradientWave();
+int8_t  currentLed   = 0;
+int16_t currentDuty  = DUTY_100;
+bool    isFadingDown = true; // true: 100% -> 10%, false: 10% -> 100%
+
+unsigned long lastUpdate = 0;
+unsigned long pauseStart = 0;
+bool          isPaused   = false;
+
+uint8_t ledDutyState[TOTAL_LEDS] = {DUTY_100, DUTY_100, DUTY_100, DUTY_100, 
+                                    DUTY_100, DUTY_100, DUTY_100, DUTY_100};
+
+unsigned long lastSerialPrint = 0;
 
 void setup() {
-    // Khởi tạo PWM Core v3.x+ cho toàn bộ 8 chân
+    Serial.begin(115200);
+    while (!Serial && millis() < 2000);
+
+    Serial.println("\n--- HE THONG KHOI CHAY: PWM 8 LED (STEP = 8, MIN = 10%) ---");
+    Serial.printf("Thong so: Day = %d (10%%) | Step = %d | Interval = %lums | Chu ky 8 LED = %.2fs\n", 
+                  DUTY_10, FADE_STEP, INTERVAL, (float)(29 * 8 * INTERVAL) / 1000.0);
+
     for (uint8_t i = 0; i < TOTAL_LEDS; i++) {
         ledcAttach(LED_PINS[i], PWM_FREQ, PWM_RES);
-        ledcWrite(LED_PINS[i], 0);
+        ledcWrite(LED_PINS[i], DUTY_100);
+        ledDutyState[i] = DUTY_100;
     }
 }
 
 // =============================================================================
-// [ĐOẠN THAY ĐỔI NỔI BẬT 2: BỘ ĐIỀU PHỐI NON-BLOCKING FSM]
+// [ĐOẠN THAY ĐỔI NỔI BẬT 2: KHÓA CHẶN DỐC VÀ CHUYỂN GIAO TRẠNG THÁI TẠI MỨC DUTY_10]
 // =============================================================================
 void loop() {
-    switch (currentMode) {
-        case 1:
-            if (runGradientSeesaw()) currentMode = 2;
-            break;
-        case 2:
-            if (runRotatingGradientWave()) currentMode = 1;
-            break;
-    }
-}
-/* =============================================================================
-   [COMMENT BLOCK - GIẢI THÍCH PHẦN ĐÃ SỬA]:
-   - Vòng lặp loop() hoạt động tuần tự nhưng hoàn toàn giải phóng CPU (non-blocking).
-   - Chuyển giao mượt mà giữa hiệu ứng bập bênh dải sáng và sóng dốc tuần hoàn.
-   ============================================================================= */
-
-// =============================================================================
-// [ĐOẠN THAY ĐỔI NỔI BẬT 3: THUẬT TOÁN NỘI SUY TUYẾN TÍNH GRADIENT BẬP BÊNH]
-// Công thức: Duty(i) = Head + i * (Tail - Head) / 7
-// Khi LED 1 = 255 thì LED 8 = 0. Các LED ở giữa nhận giá trị giảm dần bậc thang.
-// =============================================================================
-
-bool runGradientSeesaw() {
     unsigned long currentMillis = millis();
-    if (currentMillis - stateSeesaw.lastUpdate >= stateSeesaw.INTERVAL) {
-        stateSeesaw.lastUpdate = currentMillis;
 
-        int16_t duty1 = stateSeesaw.headDuty;       // Độ sáng LED 1
-        int16_t duty8 = 255 - stateSeesaw.headDuty; // Độ sáng LED 8 (nghịch đảo tuyệt đối)
+    // 1. LUỒNG SERIAL TELEMETRY: In định kỳ mỗi 500ms (0.5 giây)
+    if (currentMillis - lastSerialPrint >= SERIAL_INTERVAL) {
+        lastSerialPrint = currentMillis;
 
-        // Phân phối gradient tuyến tính dọc theo 8 LED
+        Serial.printf("[%6lu ms] Che do: %-15s | LED tac dong: L%d | Duty LED: %3d\n",
+                      currentMillis,
+                      isPaused ? "DANG DUNG (PAUSE)" : (isFadingDown ? "GIAM (100->10%)" : "TANG (10->100%)"),
+                      currentLed + 1,
+                      currentDuty);
+
+        Serial.print("            PWM [L1->L8]: ");
         for (uint8_t i = 0; i < TOTAL_LEDS; i++) {
-            int16_t dutyI = duty1 + (int32_t)(i * (duty8 - duty1)) / (TOTAL_LEDS - 1);
-            ledcWrite(LED_PINS[i], (uint8_t)constrain(dutyI, 0, 255));
+            Serial.printf("%3d ", ledDutyState[i]);
         }
-
-        stateSeesaw.headDuty += stateSeesaw.step;
-
-        // Đảo chiều dốc khi chạm 2 ngưỡng cực trị
-        if (stateSeesaw.headDuty <= 0) {
-            stateSeesaw.headDuty = 0;
-            stateSeesaw.step = abs(stateSeesaw.step);
-        } else if (stateSeesaw.headDuty >= 255) {
-            stateSeesaw.headDuty = 255;
-            stateSeesaw.step = -abs(stateSeesaw.step);
-            stateSeesaw.cycleCount++;
-
-            if (stateSeesaw.cycleCount >= 3) { // Chạy 3 chu kỳ hoàn chỉnh
-                stateSeesaw.cycleCount = 0;
-                return true;
-            }
-        }
+        Serial.println();
     }
-    return false;
-}
-/* =============================================================================
-   [COMMENT BLOCK - GIẢI THÍCH PHẦN ĐÃ SỬA]:
-   - Toán tử nội suy số nguyên `duty1 + (i * (duty8 - duty1)) / 7` đảm bảo tính toán 
-     nhẹ nhất cho MCU, triệt tiêu việc dùng số thực float.
-   - Tại đỉnh: LED 1 = 255, LED 2 ≈ 219, LED 3 ≈ 182, LED 4 ≈ 146, 
-     LED 5 ≈ 109, LED 6 ≈ 73, LED 7 ≈ 36, LED 8 = 0.
-   ============================================================================= */
 
-// =============================================================================
-// [ĐOẠN THAY ĐỔI NỔI BẬT 4: THUẬT TOÁN SÓNG DỐC TUẦN HOÀN (ROTATING GRADIENT)]
-// Dịch pha tuần hoàn liên tục theo góc 360 độ. Khoảng cách pha giữa LED 1 và 
-// LED 8 luôn bằng 180 độ (π rad) -> Luôn đảm bảo: LED 1 MAX thì LED 8 MIN.
-// =============================================================================
+    // 2. Xử lý khoảng dừng 300ms giữa hai chiều biến thiên
+    if (isPaused) {
+        if (currentMillis - pauseStart >= PAUSE_MS) {
+            isPaused = false;
+        }
+        return;
+    }
 
-bool runRotatingGradientWave() {
-    unsigned long currentMillis = millis();
-    if (currentMillis - stateWave.lastUpdate >= stateWave.INTERVAL) {
-        stateWave.lastUpdate = currentMillis;
+    // 3. Nội suy độ sáng tuần tự từng LED
+    if (currentMillis - lastUpdate >= INTERVAL) {
+        lastUpdate = currentMillis;
 
-        for (uint8_t i = 0; i < TOTAL_LEDS; i++) {
-            // Mỗi LED lệch nhau đúng (180 độ / 7) ≈ 25.7 độ
-            // Do đó LED 0 (LED 1) và LED 7 (LED 8) luôn lệch nhau chính xác 180 độ
-            int32_t phase = (stateWave.waveAngle + (i * 180) / (TOTAL_LEDS - 1)) % 360;
+        if (isFadingDown) {
+            // GIẢM DẦN TỪNG LED: 255 -> 26
+            currentDuty -= FADE_STEP;
 
-            // Chuyển góc pha thành tam giác sóng đối xứng (0 -> 255 -> 0)
-            int16_t duty;
-            if (phase < 180) {
-                duty = (phase * 255) / 180;
+            if (currentDuty <= DUTY_10) {
+                currentDuty = DUTY_10; // Khóa cứng mức sàn 26, không cho tụt về 0
+                ledcWrite(LED_PINS[currentLed], (uint8_t)currentDuty);
+                ledDutyState[currentLed] = (uint8_t)currentDuty;
+
+                currentLed++;
+                currentDuty = DUTY_100; // Khởi tạo mức ban đầu cho LED kế tiếp
+
+                if (currentLed >= TOTAL_LEDS) {
+                    currentLed   = 0;
+                    currentDuty  = DUTY_10;
+                    isFadingDown = false; // Đổi sang chu trình tăng
+                    isPaused     = true;
+                    pauseStart   = currentMillis;
+                }
             } else {
-                duty = ((360 - phase) * 255) / 180;
+                ledcWrite(LED_PINS[currentLed], (uint8_t)currentDuty);
+                ledDutyState[currentLed] = (uint8_t)currentDuty;
             }
+        } 
+        else {
+            // TĂNG DẦN TỪNG LED: 26 -> 255
+            currentDuty += FADE_STEP;
 
-            ledcWrite(LED_PINS[i], (uint8_t)constrain(duty, 0, 255));
-        }
+            if (currentDuty >= DUTY_100) {
+                currentDuty = DUTY_100; // Khóa cứng mức đỉnh 255
+                ledcWrite(LED_PINS[currentLed], (uint8_t)currentDuty);
+                ledDutyState[currentLed] = (uint8_t)currentDuty;
 
-        stateWave.waveAngle = (stateWave.waveAngle + 3) % 360;
-        stateWave.stepCount++;
+                currentLed++;
+                currentDuty = DUTY_10; // Khởi tạo mức sàn 26 cho LED kế tiếp
 
-        if (stateWave.stepCount >= 360) { // Quét đủ 3 vòng tuần hoàn
-            stateWave.stepCount = 0;
-            stateWave.waveAngle = 0;
-            return true;
+                if (currentLed >= TOTAL_LEDS) {
+                    currentLed   = 0;
+                    currentDuty  = DUTY_100;
+                    isFadingDown = true; // Đổi sang chu trình giảm
+                    isPaused     = true;
+                    pauseStart   = currentMillis;
+                }
+            } else {
+                ledcWrite(LED_PINS[currentLed], (uint8_t)currentDuty);
+                ledDutyState[currentLed] = (uint8_t)currentDuty;
+            }
         }
     }
-    return false;
 }
 /* =============================================================================
    [COMMENT BLOCK - GIẢI THÍCH PHẦN ĐÃ SỬA]:
-   - Góc pha giữa LED i và LED i+1 được khóa cứng theo bước `180 / 7`. 
-   - Khi `phase(LED 1) = 90°` (đạt đỉnh 255) thì `phase(LED 8) = 270°` (đáy 0).
-   - Hiệu ứng tạo ra dải ánh sáng chuyển màu mượt mà, trôi liên tục nhưng luôn 
-     giữ nguyên mối quan hệ đối đỉnh cực đại - cực tiểu giữa 2 đầu.
+   - Trong nhánh giảm: Điều kiện `currentDuty <= DUTY_10` chặn cứng mức giá trị tại 26,
+     loại bỏ hoàn toàn trạng thái tắt hẳn (duty = 0).
+   - Trong nhánh tăng: Khởi tạo LED kế tiếp với `currentDuty = DUTY_10` (thay vì mức 0 cũ)
+     để bắt đầu dốc tăng từ đúng 10% công suất lên 255.
+   - Dữ liệu in qua UART hiển thị chính xác mức sàn 26 trên cả 8 vị trí mảng.
    ============================================================================= */
