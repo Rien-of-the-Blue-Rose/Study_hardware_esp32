@@ -1,152 +1,112 @@
-// src/main.cpp
+// path: src/main.cpp
 #include <Arduino.h>
 
-const uint8_t LED_PINS[8] = {19, 18, 5, 17, 16, 4, 2, 15};
-const uint8_t TOTAL_LEDS = 8;
+// ==========================================
+// CẤU HÌNH PHẦN CỨNG & THÔNG SỐ PWM
+// ==========================================
 
-const uint32_t PWM_FREQ = 5000;
-const uint8_t  PWM_RES  = 8; // 8-bit (0 - 255)
+// Mảng chứa danh sách các chân GPIO kết nối với các LED 
+const uint8_t LED_PINS[] = {19, 18, 5, 17, 16, 4, 2, 15};
+// Tổng số LED = kích thước của mảng LED_PINS = 8 LED
+const uint8_t TOTAL_LEDS = sizeof(LED_PINS);
 
-// =============================================================================
-// [ĐOẠN THAY ĐỔI NỔI BẬT 1: KHÔI PHỤC NGƯỠNG SÀN 10% VÀ TÍNH TOÁN INTERVAL >= 10S]
-// - Sửa DUTY_0 (0) quay lại DUTY_10 = 26 (round(255 * 0.10) = 25.5 -> 26).
-// - Giữ FADE_STEP = 8 mỗi nấc.
-// - Khoảng dốc: 255 - 26 = 229 đơn vị -> Cần 29 bước nhảy cho mỗi LED.
-// - Cấu hình INTERVAL = 45ms: 29 bước * 8 LED * 45ms = 10440ms = 10.44 giây.
-// =============================================================================
-const uint8_t DUTY_100 = 255;
-const uint8_t DUTY_10  = 7; // Mức sàn 10%: giữ sáng mờ, không ngắt dòng
+// Tần số xung PWM (5 kHz giúp mắt người không thấy hiện tượng nhấp nháy)
+const uint32_t PWM_FREQ  = 5000;
+// Độ phân giải PWM 8-bit (dải giá trị duty cycle từ 0 đến 255)
+const uint8_t  PWM_RES   = 8;
+// Ngưỡng duty tối thiểu (tương ứng với mức sáng min màn chương trình đang xét)
+const uint8_t  DUTY_MIN  = 7;  
+// Ngưỡng duty tối đa (tương ứng với mức sáng max mà chương trình đang xét)
+const uint8_t  DUTY_MAX  = 255;
+// Bước thay đổi duty cycle mỗi chu kỳ cập nhật. Ở đây đặt = 8
+const uint8_t  FADE_STEP = 8;
+// Thời lượng của mỗi chu kỳ làm mới trạng thái LED (ms)
+const unsigned long INTERVAL = 45;
+// Thời gian dừng (ms) giữa 2 lượt quét xuôi/ngược
+const unsigned long PAUSE_MS = 300;
 
-const uint8_t       FADE_STEP = 8;  // Bước nhảy 8 đơn vị duty
-const unsigned long INTERVAL  = 45; // 45ms mỗi bước -> 8 LED quét mất 10.44 giây
-const unsigned long PAUSE_MS  = 300;
+// ==========================================
+// BIẾN QUẢN LÝ TRẠNG THÁI HIỆU ỨNG (STATE MACHINE)
+// ==========================================
 
-const unsigned long SERIAL_INTERVAL = 500; // Serial in telemetry mỗi 0.5 giây
-/* =============================================================================
-   [COMMENT BLOCK - GIẢI THÍCH PHẦN ĐÃ SỬA]:
-   - Khôi phục hằng số `DUTY_10 = 26` thay thế cho mức `DUTY_0 = 0` bị nhầm lẫn ở bản trước.
-   - Tính toán lại `INTERVAL = 45ms` để khớp với 29 bước nhảy của khoảng dải 229,
-     đảm bảo tổng thời gian quét qua 8 LED vượt ngưỡng tối thiểu 10 giây (10.44s).
-   ============================================================================= */
-
+// Chỉ số index (số thứ tự) của LED đang thực hiện hiệu ứng fade (0 -> Số lượng led - 1) (Aka 0 -> 7)
 int8_t  currentLed   = 0;
-int16_t currentDuty  = DUTY_100;
-bool    isFadingDown = true; // true: 100% -> 10%, false: 10% -> 100%
+// Giá trị duty cycle hiện tại của LED đang được quét
+int16_t currentDuty  = DUTY_MIN;
+// Chiều biến thiên duty: -1 = giảm dần (255 -> 7) | 1 = tăng dần (7 -> 255)
+int8_t  fadeDir      = 1;
 
+// Mốc thời gian (ms) ghi nhận lần cập nhật duty gần nhất cho non-blocking delay
 unsigned long lastUpdate = 0;
+// Mốc thời gian (ms) bắt đầu khoảng dừng giữa hai chu trình quét
 unsigned long pauseStart = 0;
+// Cờ báo hiệu hệ thống đang trong khoảng thời gian tạm dừng (true/false)
 bool          isPaused   = false;
 
-uint8_t ledDutyState[TOTAL_LEDS] = {DUTY_100, DUTY_100, DUTY_100, DUTY_100, 
-                                    DUTY_100, DUTY_100, DUTY_100, DUTY_100};
-
-unsigned long lastSerialPrint = 0;
-
 void setup() {
-    Serial.begin(115200);
-    while (!Serial && millis() < 2000);
-
-    Serial.println("\n--- HE THONG KHOI CHAY: PWM 8 LED (STEP = 8, MIN = 10%) ---");
-    Serial.printf("Thong so: Day = %d (10%%) | Step = %d | Interval = %lums | Chu ky 8 LED = %.2fs\n", 
-                  DUTY_10, FADE_STEP, INTERVAL, (float)(29 * 8 * INTERVAL) / 1000.0);
-
+    // Khởi tạo PWM cho từng chân LED thông qua API LEDC của ESP32 Arduino Core 3.x
     for (uint8_t i = 0; i < TOTAL_LEDS; i++) {
+        pinMode(LED_PINS[i], OUTPUT);
+        digitalWrite(LED_PINS[i], LOW);
+        // Gắn chân GPIO vào bộ phát PWM với tần số và độ phân giải đã định
         ledcAttach(LED_PINS[i], PWM_FREQ, PWM_RES);
-        ledcWrite(LED_PINS[i], DUTY_100);
-        ledDutyState[i] = DUTY_100;
+        // Đặt trạng thái ban đầu cho toàn bộ LED về DUTY_MIN
+        ledcWrite(LED_PINS[i], (uint32_t)DUTY_MIN);
     }
 }
 
-// =============================================================================
-// [ĐOẠN THAY ĐỔI NỔI BẬT 2: KHÓA CHẶN DỐC VÀ CHUYỂN GIAO TRẠNG THÁI TẠI MỨC DUTY_10]
-// =============================================================================
 void loop() {
-    unsigned long currentMillis = millis();
+    unsigned long now = millis();
 
-    // 1. LUỒNG SERIAL TELEMETRY: In định kỳ mỗi 500ms (0.5 giây)
-    if (currentMillis - lastSerialPrint >= SERIAL_INTERVAL) {
-        lastSerialPrint = currentMillis;
-
-        Serial.printf("[%6lu ms] Che do: %-15s | LED tac dong: L%d | Duty LED: %3d\n",
-                      currentMillis,
-                      isPaused ? "DANG DUNG (PAUSE)" : (isFadingDown ? "GIAM (100->10%)" : "TANG (10->100%)"),
-                      currentLed + 1,
-                      currentDuty);
-
-        Serial.print("            PWM [L1->L8]: ");
-        for (uint8_t i = 0; i < TOTAL_LEDS; i++) {
-            Serial.printf("%3d ", ledDutyState[i]);
-        }
-        Serial.println();
-    }
-
-    // 2. Xử lý khoảng dừng 300ms giữa hai chiều biến thiên
+    // -------------------------------------------------------------------------
+    // 1. XỬ LÝ KHOẢNG NGHỈ GIỮA HAI CHU TRÌNH QUÉT (NON-BLOCKING)
+    // -------------------------------------------------------------------------
     if (isPaused) {
-        if (currentMillis - pauseStart >= PAUSE_MS) {
+        if (now - pauseStart >= PAUSE_MS) {
             isPaused = false;
+            // Cập nhật lại mốc lastUpdate để triệt tiêu độ trễ cộng dồn gây giật nhịp ngay sau pause
+            lastUpdate = now; 
         }
-        return;
+        return; // Dừng thực thi các logic bên dưới khi đang trong thời gian pause
     }
 
-    // 3. Nội suy độ sáng tuần tự từng LED
-    if (currentMillis - lastUpdate >= INTERVAL) {
-        lastUpdate = currentMillis;
+    // -------------------------------------------------------------------------
+    // 2. BỘ ĐỊNH THÌ CẬP NHẬT TRẠNG THÁI THEO INTERVAL
+    // -------------------------------------------------------------------------
+    if (now - lastUpdate < INTERVAL) return;
+    lastUpdate = now;
 
-        if (isFadingDown) {
-            // GIẢM DẦN TỪNG LED: 255 -> 26
-            currentDuty -= FADE_STEP;
+    // -------------------------------------------------------------------------
+    // 3. TÍNH TOÁN VÀ ÁP ĐẶT DUTY CYCLE THEO CHIỀU BIẾN THIÊN
+    // -------------------------------------------------------------------------
+    currentDuty += fadeDir * FADE_STEP;
+    
+    // Kiểm tra xem duty cycle đã chạm hoặc vượt qua ngưỡng giới hạn tương ứng chưa
+    bool reachedLimit = (fadeDir < 0) ? (currentDuty <= DUTY_MIN) : (currentDuty >= DUTY_MAX);
 
-            if (currentDuty <= DUTY_10) {
-                currentDuty = DUTY_10; // Khóa cứng mức sàn 26, không cho tụt về 0
-                ledcWrite(LED_PINS[currentLed], (uint8_t)currentDuty);
-                ledDutyState[currentLed] = (uint8_t)currentDuty;
+    // Kẹp giá trị (clamp) để tránh hiện tượng tràn số nguyên hoặc vượt dải băm xung
+    if (reachedLimit) {
+        currentDuty = (fadeDir < 0) ? DUTY_MIN : DUTY_MAX;
+    }
 
-                currentLed++;
-                currentDuty = DUTY_100; // Khởi tạo mức ban đầu cho LED kế tiếp
+    // Cập nhật xung PWM thực tế tới chân LED đang hoạt động
+    ledcWrite(LED_PINS[currentLed], (uint32_t)currentDuty);
 
-                if (currentLed >= TOTAL_LEDS) {
-                    currentLed   = 0;
-                    currentDuty  = DUTY_10;
-                    isFadingDown = false; // Đổi sang chu trình tăng
-                    isPaused     = true;
-                    pauseStart   = currentMillis;
-                }
-            } else {
-                ledcWrite(LED_PINS[currentLed], (uint8_t)currentDuty);
-                ledDutyState[currentLed] = (uint8_t)currentDuty;
-            }
-        } 
-        else {
-            // TĂNG DẦN TỪNG LED: 26 -> 255
-            currentDuty += FADE_STEP;
-
-            if (currentDuty >= DUTY_100) {
-                currentDuty = DUTY_100; // Khóa cứng mức đỉnh 255
-                ledcWrite(LED_PINS[currentLed], (uint8_t)currentDuty);
-                ledDutyState[currentLed] = (uint8_t)currentDuty;
-
-                currentLed++;
-                currentDuty = DUTY_10; // Khởi tạo mức sàn 26 cho LED kế tiếp
-
-                if (currentLed >= TOTAL_LEDS) {
-                    currentLed   = 0;
-                    currentDuty  = DUTY_100;
-                    isFadingDown = true; // Đổi sang chu trình giảm
-                    isPaused     = true;
-                    pauseStart   = currentMillis;
-                }
-            } else {
-                ledcWrite(LED_PINS[currentLed], (uint8_t)currentDuty);
-                ledDutyState[currentLed] = (uint8_t)currentDuty;
-            }
+    // -------------------------------------------------------------------------
+    // 4. CHUYỂN BƯỚC ĐIỀU KHIỂN SANG LED TIẾP THEO HOẶC ĐỔI CHIỀU QUÉT
+    // -------------------------------------------------------------------------
+    if (reachedLimit) {
+        currentLed++; // Chuyển quyền điều khiển sang bóng LED kế tiếp
+        
+        // Khi toàn bộ 8 LED đã hoàn thành chu kỳ fade hiện tại
+        if (currentLed >= TOTAL_LEDS) {
+            currentLed = 0;         // Reset index về LED đầu tiên
+            fadeDir    = -fadeDir;  // Đảo ngược chiều biến thiên duty cho chu kỳ tiếp theo
+            isPaused   = true;      // Kích hoạt trạng thái tạm dừng
+            pauseStart = now;       // Lưu mốc thời gian bắt đầu dừng
         }
+        
+        // Đặt mức khởi điểm duty cycle cho LED kế tiếp tùy thuộc vào chiều fade mới
+        currentDuty = (fadeDir < 0) ? DUTY_MAX : DUTY_MIN;
     }
 }
-/* =============================================================================
-   [COMMENT BLOCK - GIẢI THÍCH PHẦN ĐÃ SỬA]:
-   - Trong nhánh giảm: Điều kiện `currentDuty <= DUTY_10` chặn cứng mức giá trị tại 26,
-     loại bỏ hoàn toàn trạng thái tắt hẳn (duty = 0).
-   - Trong nhánh tăng: Khởi tạo LED kế tiếp với `currentDuty = DUTY_10` (thay vì mức 0 cũ)
-     để bắt đầu dốc tăng từ đúng 10% công suất lên 255.
-   - Dữ liệu in qua UART hiển thị chính xác mức sàn 26 trên cả 8 vị trí mảng.
-   ============================================================================= */
