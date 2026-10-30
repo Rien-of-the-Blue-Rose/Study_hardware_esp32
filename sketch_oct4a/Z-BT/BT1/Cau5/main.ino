@@ -5,6 +5,9 @@ const uint8_t LED_TARGET_PIN = 2;
 const uint8_t BTN_UP_PIN     = 0;
 const uint8_t BTN_DOWN_PIN   = 25;
 
+const unsigned long DEBOUNCE_MS = 20;
+
+
 const uint32_t PWM_FREQ = 1000;
 const uint8_t  PWM_RES  = 8;
 const uint8_t  MAX_LEVEL = 10;
@@ -14,20 +17,26 @@ const uint8_t GAMMA_LEVELS[MAX_LEVEL + 1] = {0, 3, 8, 16, 28, 45, 72, 110, 155, 
 
 struct Button {
     uint8_t pin;
-    uint8_t lastRaw = HIGH;
-    uint8_t stable  = HIGH;
-    unsigned long lastTime = 0;
+    uint8_t button_buffer = HIGH;
+    uint8_t button_stable = HIGH;
+    unsigned long t = 0;
 
     bool pressed() {
-        uint8_t r = digitalRead(pin);
-        unsigned long now = millis();
-        if (r != lastRaw) {
-            lastTime = now;
-            lastRaw = r;
+        uint8_t button_now = digitalRead(pin);
+
+        if (button_now != button_buffer) {
+            t = millis();
+            button_buffer = button_now;
         }
-        if ((now - lastTime >= 50) && (r != stable)) {
-            stable = r;
-            return stable == LOW;
+
+        if ((millis() - t) >= DEBOUNCE_MS) {
+            if (button_buffer != button_stable) {
+                button_stable = button_buffer;
+
+                if (button_stable == LOW) {
+                    return true;
+                }
+            }
         }
         return false;
     }
